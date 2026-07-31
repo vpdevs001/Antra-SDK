@@ -26,12 +26,7 @@ export interface Usage {
 }
 
 /** Why generation stopped. Normalized across providers (OpenAI's "stop"/"tool_calls", Anthropic's "end_turn"/"tool_use", etc). */
-export type FinishReason =
-  | "stop"
-  | "length"
-  | "tool_calls"
-  | "content_filter"
-  | "error";
+export type FinishReason = "stop" | "length" | "tool_calls" | "content_filter" | "error";
 
 export interface GenerateResult {
   content: string;

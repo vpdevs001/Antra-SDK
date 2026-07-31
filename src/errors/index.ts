@@ -12,10 +12,7 @@ export class AntraError extends Error {
   /** Original error/response from the provider, for debugging. */
   public override readonly cause: unknown;
 
-  constructor(
-    message: string,
-    opts: { code: string; provider?: string; cause?: unknown }
-  ) {
+  constructor(message: string, opts: { code: string; provider?: string; cause?: unknown }) {
     super(message);
     this.name = this.constructor.name;
     this.code = opts.code;
@@ -78,10 +75,7 @@ export class CancelledError extends AntraError {
 /** Tool call arguments failed schema validation, or tool execution threw. */
 export class ToolExecutionError extends AntraError {
   public readonly toolName: string;
-  constructor(
-    message: string,
-    opts: { toolName: string; provider?: string; cause?: unknown }
-  ) {
+  constructor(message: string, opts: { toolName: string; provider?: string; cause?: unknown }) {
     super(message, { code: "tool_execution_error", ...opts });
     this.toolName = opts.toolName;
   }

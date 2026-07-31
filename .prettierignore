@@ -1,0 +1,22 @@
+# Build output
+dist
+*.tsbuildinfo
+
+# Dependencies
+node_modules
+
+# Coverage & test artifacts
+coverage
+
+# Generated docs site (Chapter 14)
+docs/.vitepress/dist
+docs/.vitepress/cache
+
+# Package manager files
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# Misc
+.DS_Store
+*.log
