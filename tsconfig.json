@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    /* Language & Module */
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    /* Type Safety — strict is non-negotiable given our "end-to-end type safety" priority */
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+
+    /* Interop */
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+
+    /* No emit yet — we're just typechecking in Chapter 1 (`npm run typecheck`). Chapter 12 introduces tsup for actual build output. */
+    "noEmit": true,
+
+    "rootDir": "src",
+    "baseUrl": "."
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

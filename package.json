@@ -1,0 +1,17 @@
+{
+  "name": "antra-sdk",
+  "version": "0.0.1",
+  "private": true,
+  "description": "The AI SDK for building type-safe, multi-provider AI applications with minimal boilerplate.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}
