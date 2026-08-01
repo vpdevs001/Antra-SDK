@@ -81,6 +81,22 @@ export class ToolExecutionError extends AntraError {
   }
 }
 
+/** A guardrail (input, output, or tool) rejected a value in "strict" mode. */
+export class GuardrailError extends AntraError {
+  /** Which kind of guardrail triggered this — useful for catch blocks that only care about one kind. */
+  public readonly guardrailType: "input" | "output" | "tool";
+  /** Name given at registration, if any. */
+  public readonly guardrailName: string | undefined;
+  constructor(
+    message: string,
+    opts: { guardrailType: "input" | "output" | "tool"; guardrailName?: string; cause?: unknown }
+  ) {
+    super(message, { code: "guardrail_error", cause: opts.cause });
+    this.guardrailType = opts.guardrailType;
+    this.guardrailName = opts.guardrailName;
+  }
+}
+
 /** Catch-all for provider-side failures (5xx, malformed responses, etc). */
 export class ProviderError extends AntraError {
   public readonly statusCode: number | undefined;

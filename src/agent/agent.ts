@@ -3,7 +3,13 @@ import type { Message, ContentPart, ToolDefinition, ToolCall } from "../core/typ
 import type { Tool } from "../tools/define-tool.js";
 import type { AgentEvent, AgentListener, AgentResult, AgentFinishReason } from "./types.js";
 import { buildSystemPrompt } from "./prompts.js";
-import { ToolExecutionError, CancelledError } from "../errors/index.js";
+import { ToolExecutionError, CancelledError, GuardrailError } from "../errors/index.js";
+import type {
+  GuardrailRegistration,
+  InputGuardrail,
+  OutputGuardrail,
+  ToolGuardrail,
+} from "../guardrails/types.js";
 
 export interface AgentRunOptions {
   signal?: AbortSignal;
@@ -22,6 +28,9 @@ export class AgentBuilder {
   private _maxSteps = 10;
   private _useCotNudge = true;
   private _listeners: AgentListener[] = [];
+  private _inputGuardrails: GuardrailRegistration<InputGuardrail>[] = [];
+  private _outputGuardrails: GuardrailRegistration<OutputGuardrail>[] = [];
+  private _toolGuardrails: GuardrailRegistration<ToolGuardrail>[] = [];
 
   /** The Antra client used to talk to the model. Required. */
   client(client: Antra): this {
@@ -71,6 +80,46 @@ export class AgentBuilder {
     return this;
   }
 
+  /**
+   * Validates/rejects the user's input before it reaches the model.
+   * `mode` is required — you decide whether a violation hard-fails
+   * (`"strict"`, throws GuardrailError) or ends the run softly
+   * (`"soft"`, returns an AgentResult with finishReason
+   * "guardrail_blocked" instead of throwing).
+   */
+  inputGuardrail(fn: InputGuardrail, opts: { mode: "strict" | "soft"; name?: string }): this {
+    this._inputGuardrails.push({
+      fn,
+      mode: opts.mode,
+      ...(opts.name !== undefined ? { name: opts.name } : {}),
+    });
+    return this;
+  }
+
+  /** Validates/redacts the model's final answer before it's returned. Same `mode` contract as inputGuardrail. */
+  outputGuardrail(fn: OutputGuardrail, opts: { mode: "strict" | "soft"; name?: string }): this {
+    this._outputGuardrails.push({
+      fn,
+      mode: opts.mode,
+      ...(opts.name !== undefined ? { name: opts.name } : {}),
+    });
+    return this;
+  }
+
+  /**
+   * Validates a requested tool call before it executes. Allow/reject
+   * only for now — human-approval (pause and wait) is a later addition.
+   * Same `mode` contract as the others.
+   */
+  toolGuardrail(fn: ToolGuardrail, opts: { mode: "strict" | "soft"; name?: string }): this {
+    this._toolGuardrails.push({
+      fn,
+      mode: opts.mode,
+      ...(opts.name !== undefined ? { name: opts.name } : {}),
+    });
+    return this;
+  }
+
   build(): Agent {
     if (!this._client) {
       throw new Error("AgentBuilder: `.client(...)` is required before `.build()`.");
@@ -91,6 +140,9 @@ export class AgentBuilder {
       maxSteps: this._maxSteps,
       useCotNudge: this._useCotNudge,
       listeners: this._listeners,
+      inputGuardrails: this._inputGuardrails,
+      outputGuardrails: this._outputGuardrails,
+      toolGuardrails: this._toolGuardrails,
     };
   }
 }
@@ -103,6 +155,9 @@ export class Agent {
   private readonly toolDefinitions: ToolDefinition[];
   private readonly maxSteps: number;
   private readonly listeners: AgentListener[];
+  private readonly inputGuardrails: GuardrailRegistration<InputGuardrail>[];
+  private readonly outputGuardrails: GuardrailRegistration<OutputGuardrail>[];
+  private readonly toolGuardrails: GuardrailRegistration<ToolGuardrail>[];
 
   constructor(builder: AgentBuilder) {
     const config = builder._config;
@@ -111,6 +166,9 @@ export class Agent {
     this.systemPrompt = buildSystemPrompt(config.instructions, config.useCotNudge);
     this.maxSteps = config.maxSteps;
     this.listeners = [...config.listeners];
+    this.inputGuardrails = [...config.inputGuardrails];
+    this.outputGuardrails = [...config.outputGuardrails];
+    this.toolGuardrails = [...config.toolGuardrails];
 
     this.toolMap = new Map(config.tools.map((t) => [t.name, t]));
     this.toolDefinitions = config.tools.map((t) => ({
@@ -139,7 +197,21 @@ export class Agent {
    * calling tools, `maxSteps` is hit, or the run is aborted.
    */
   async run(query: string, options: AgentRunOptions = {}): Promise<AgentResult> {
-    const messages: Message[] = [{ role: "user", content: query }];
+    // --- Input guardrails run once, before anything is sent to the model. ---
+    const inputCheck = await this.runInputGuardrails(0, query);
+    if (inputCheck.blocked) {
+      const blockedResult: AgentResult = {
+        content: inputCheck.reason,
+        messages: [{ role: "user", content: query }],
+        finishReason: "guardrail_blocked",
+        steps: 0,
+      };
+      this.emit({ type: "finish", step: 0, result: blockedResult });
+      return blockedResult;
+    }
+    const effectiveQuery = inputCheck.modifiedValue ?? query;
+
+    const messages: Message[] = [{ role: "user", content: effectiveQuery }];
     let step = 0;
     let finishReason: AgentFinishReason = "stop";
     let finalContent = "";
@@ -173,6 +245,19 @@ export class Agent {
       messages.push({ role: "assistant", content: assistantContent });
 
       if (result.finishReason !== "tool_calls" || result.toolCalls.length === 0) {
+        // --- Output guardrails run only on a genuine final answer, never on intermediate turns. ---
+        const outputCheck = await this.runOutputGuardrails(step, finalContent);
+        if (outputCheck.blocked) {
+          const blockedResult: AgentResult = {
+            content: outputCheck.reason,
+            messages,
+            finishReason: "guardrail_blocked",
+            steps: step,
+          };
+          this.emit({ type: "finish", step, result: blockedResult });
+          return blockedResult;
+        }
+        finalContent = outputCheck.modifiedValue ?? finalContent;
         finishReason = "stop";
         break;
       }
@@ -232,6 +317,19 @@ export class Agent {
 
     this.emit({ type: "tool_call_start", step, toolCall });
 
+    // Tool guardrails run before schema validation or execution — they can
+    // reject a call outright (e.g. a dangerous command, a disallowed
+    // recipient) regardless of whether its arguments are well-formed.
+    const toolCheck = await this.runToolGuardrails(step, toolCall);
+    if (toolCheck.blocked) {
+      const error = new ToolExecutionError(
+        `Tool call "${toolCall.name}" blocked by guardrail: ${toolCheck.reason}`,
+        { toolName: toolCall.name }
+      );
+      this.emit({ type: "tool_call_error", step, toolCall, error });
+      return { value: { error: error.message }, isError: true };
+    }
+
     const parsed = tool.schema.safeParse(toolCall.args);
     if (!parsed.success) {
       const error = new ToolExecutionError(
@@ -257,5 +355,100 @@ export class Agent {
       this.emit({ type: "tool_call_error", step, toolCall, error });
       return { value: { error: error.message }, isError: true };
     }
+  }
+
+  // --- Guardrail runners ---
+  // Each returns a small internal shape ({blocked, reason, modifiedValue})
+  // rather than throwing directly, EXCEPT in "strict" mode, where a
+  // GuardrailError is thrown immediately — this keeps strict-mode
+  // behavior identical regardless of which guardrail category triggered
+  // it (a thrown error always propagates out of run(), full stop).
+
+  private async runInputGuardrails(
+    step: number,
+    input: string
+  ): Promise<{ blocked: boolean; reason: string; modifiedValue?: string }> {
+    let value = input;
+    for (const reg of this.inputGuardrails) {
+      const result = await reg.fn(value);
+      if (!result.passed) {
+        const reason = result.reason ?? "Input guardrail rejected the input.";
+        this.emit({
+          type: "guardrail_triggered",
+          step,
+          guardrailType: "input",
+          guardrailName: reg.name,
+          mode: reg.mode,
+          reason,
+        });
+        if (reg.mode === "strict") {
+          throw new GuardrailError(reason, {
+            guardrailType: "input",
+            ...(reg.name !== undefined ? { guardrailName: reg.name } : {}),
+          });
+        }
+        return { blocked: true, reason };
+      }
+      if (result.modifiedValue !== undefined) value = result.modifiedValue;
+    }
+    return { blocked: false, reason: "", modifiedValue: value };
+  }
+
+  private async runOutputGuardrails(
+    step: number,
+    output: string
+  ): Promise<{ blocked: boolean; reason: string; modifiedValue?: string }> {
+    let value = output;
+    for (const reg of this.outputGuardrails) {
+      const result = await reg.fn(value);
+      if (!result.passed) {
+        const reason = result.reason ?? "Output guardrail rejected the response.";
+        this.emit({
+          type: "guardrail_triggered",
+          step,
+          guardrailType: "output",
+          guardrailName: reg.name,
+          mode: reg.mode,
+          reason,
+        });
+        if (reg.mode === "strict") {
+          throw new GuardrailError(reason, {
+            guardrailType: "output",
+            ...(reg.name !== undefined ? { guardrailName: reg.name } : {}),
+          });
+        }
+        return { blocked: true, reason };
+      }
+      if (result.modifiedValue !== undefined) value = result.modifiedValue;
+    }
+    return { blocked: false, reason: "", modifiedValue: value };
+  }
+
+  private async runToolGuardrails(
+    step: number,
+    toolCall: ToolCall
+  ): Promise<{ blocked: boolean; reason: string }> {
+    for (const reg of this.toolGuardrails) {
+      const result = await reg.fn(toolCall);
+      if (!result.passed) {
+        const reason = result.reason ?? `Tool guardrail rejected the call to "${toolCall.name}".`;
+        this.emit({
+          type: "guardrail_triggered",
+          step,
+          guardrailType: "tool",
+          guardrailName: reg.name,
+          mode: reg.mode,
+          reason,
+        });
+        if (reg.mode === "strict") {
+          throw new GuardrailError(reason, {
+            guardrailType: "tool",
+            ...(reg.name !== undefined ? { guardrailName: reg.name } : {}),
+          });
+        }
+        return { blocked: true, reason };
+      }
+    }
+    return { blocked: false, reason: "" };
   }
 }

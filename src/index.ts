@@ -37,6 +37,7 @@ export {
   TimeoutError,
   CancelledError,
   ToolExecutionError,
+  GuardrailError,
   ProviderError,
   isAntraError,
 } from "./errors/index.js";
@@ -47,3 +48,11 @@ export type { Tool } from "./tools/define-tool.js";
 export { Agent, AgentBuilder } from "./agent/agent.js";
 export type { AgentRunOptions } from "./agent/agent.js";
 export type { AgentEvent, AgentListener, AgentResult, AgentFinishReason } from "./agent/types.js";
+
+export type {
+  GuardrailMode,
+  GuardrailResult,
+  InputGuardrail,
+  OutputGuardrail,
+  ToolGuardrail,
+} from "./guardrails/types.js";
