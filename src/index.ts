@@ -1,5 +1,17 @@
 export { Antra } from "./client.js";
-export type { AntraConfig, CallOptions } from "./client.js";
+export type {
+  AntraConfig,
+  CallOptions,
+  ProviderName,
+  ProviderSpec,
+  SingleProviderConfig,
+  FallbackConfig,
+} from "./client.js";
+
+export { AnthropicProvider } from "./providers/anthropic/provider.js";
+export { OpenAIProvider } from "./providers/openai/provider.js";
+export { FallbackProvider } from "./providers/fallback.js";
+export type { FallbackEntry } from "./providers/fallback.js";
 
 export type {
   Message,
@@ -14,7 +26,7 @@ export type {
   ToolDefinition,
 } from "./core/types.js";
 
-export type { Provider } from "./core/provider.js";
+export type { Provider, ProviderCapabilities } from "./core/provider.js";
 
 export {
   AntraError,

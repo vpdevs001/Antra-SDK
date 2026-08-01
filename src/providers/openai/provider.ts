@@ -1,4 +1,4 @@
-import type { Provider } from "../../core/provider.js";
+import type { Provider, ProviderCapabilities } from "../../core/provider.js";
 import type {
   GenerateOptions,
   GenerateResult,
@@ -63,6 +63,11 @@ interface OpenAIStreamChunk {
 
 export class OpenAIProvider implements Provider {
   readonly name = "openai";
+  readonly capabilities: ProviderCapabilities = {
+    supportsParallelToolCalls: true,
+    supportsVision: true,
+    supportsStreaming: true,
+  };
   private readonly apiKey: string;
   private readonly baseURL: string;
   private readonly timeoutMs: number;

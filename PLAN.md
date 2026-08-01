@@ -81,7 +81,7 @@ with a mocked two-round-trip tool call.
 
 ---
 
-## Chapter 5 — Model Provider Abstraction & Fallback
+## Chapter 5 — Model Provider Abstraction & Fallback ✅ _Complete_
 
 _(Assignment requirement #10: Model Providers)_
 
