@@ -109,7 +109,7 @@ primary-provider failure in a smoke test.
 
 ---
 
-## Chapter 6 — Guardrails
+## Chapter 6 — Guardrails ✅ _Complete_
 
 _(Assignment requirement #6: Guardrails)_
 

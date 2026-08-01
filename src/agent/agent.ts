@@ -1,9 +1,16 @@
+import type { z } from "zod";
 import type { Antra } from "../client.js";
 import type { Message, ContentPart, ToolDefinition, ToolCall } from "../core/types.js";
 import type { Tool } from "../tools/define-tool.js";
 import type { AgentEvent, AgentListener, AgentResult, AgentFinishReason } from "./types.js";
-import { buildSystemPrompt } from "./prompts.js";
-import { ToolExecutionError, CancelledError, GuardrailError } from "../errors/index.js";
+import { buildSystemPrompt, buildOutputInstructions, buildRepairMessage } from "./prompts.js";
+import {
+  ToolExecutionError,
+  CancelledError,
+  GuardrailError,
+  OutputValidationError,
+} from "../errors/index.js";
+import { zodToJsonSchema } from "../tools/zod-to-schema.js";
 import type {
   GuardrailRegistration,
   InputGuardrail,
@@ -13,6 +20,14 @@ import type {
 
 export interface AgentRunOptions {
   signal?: AbortSignal;
+}
+
+/** Options for a structured-output run — see Agent.run()'s second overload. */
+export interface StructuredRunOptions<TSchema extends z.ZodTypeAny> extends AgentRunOptions {
+  /** zod schema the final answer must validate against. */
+  outputSchema: TSchema;
+  /** How many repair attempts to make if the model's output fails validation. Default 2. */
+  maxRepairAttempts?: number;
 }
 
 /**
@@ -196,7 +211,28 @@ export class Agent {
    * requests, feeds results back, and repeats until the model stops
    * calling tools, `maxSteps` is hit, or the run is aborted.
    */
-  async run(query: string, options: AgentRunOptions = {}): Promise<AgentResult> {
+  async run(query: string, options?: AgentRunOptions): Promise<AgentResult>;
+  /**
+   * Same as above, but validates the final answer against `outputSchema`
+   * and retries (asking the model to correct itself) up to
+   * `maxRepairAttempts` times on failure. `result.output` is typed from
+   * the schema via `z.infer`, preserving end-to-end type safety.
+   *
+   * IMPORTANT: `output` is only guaranteed present when
+   * `finishReason === "stop"`. If the run is aborted, blocked by a
+   * soft-mode guardrail, or hits `maxSteps` before producing valid
+   * output, `run()` throws `OutputValidationError` (or the relevant
+   * guardrail/abort path) rather than resolving without one — a
+   * resolved promise always carries valid, typed output.
+   */
+  async run<TSchema extends z.ZodTypeAny>(
+    query: string,
+    options: StructuredRunOptions<TSchema>
+  ): Promise<AgentResult & { output: z.infer<TSchema> }>;
+  async run(
+    query: string,
+    options: AgentRunOptions & { outputSchema?: z.ZodTypeAny; maxRepairAttempts?: number } = {}
+  ): Promise<AgentResult & { output?: unknown }> {
     // --- Input guardrails run once, before anything is sent to the model. ---
     const inputCheck = await this.runInputGuardrails(0, query);
     if (inputCheck.blocked) {
@@ -211,10 +247,19 @@ export class Agent {
     }
     const effectiveQuery = inputCheck.modifiedValue ?? query;
 
+    const outputSchema = options.outputSchema;
+    const maxRepairAttempts = options.maxRepairAttempts ?? 2;
+    let repairAttempts = 0;
+
+    const effectiveSystemPrompt = outputSchema
+      ? `${this.systemPrompt}\n\n${buildOutputInstructions(zodToJsonSchema(outputSchema))}`
+      : this.systemPrompt;
+
     const messages: Message[] = [{ role: "user", content: effectiveQuery }];
     let step = 0;
     let finishReason: AgentFinishReason = "stop";
     let finalContent = "";
+    let output: unknown;
 
     while (step < this.maxSteps) {
       if (options.signal?.aborted) {
@@ -227,7 +272,7 @@ export class Agent {
 
       const result = await this.client.generate({
         model: this.model,
-        system: this.systemPrompt,
+        system: effectiveSystemPrompt,
         messages,
         ...(this.toolDefinitions.length > 0 ? { tools: this.toolDefinitions } : {}),
         ...(options.signal ? { signal: options.signal } : {}),
@@ -258,6 +303,34 @@ export class Agent {
           return blockedResult;
         }
         finalContent = outputCheck.modifiedValue ?? finalContent;
+
+        if (outputSchema) {
+          const validation = validateStructuredOutput(outputSchema, finalContent);
+          if (validation.ok) {
+            output = validation.data;
+            finishReason = "stop";
+            break;
+          }
+
+          const canRetry = repairAttempts < maxRepairAttempts && step < this.maxSteps;
+          if (canRetry) {
+            repairAttempts++;
+            this.emit({
+              type: "output_repair_attempted",
+              step,
+              attempt: repairAttempts,
+              reason: validation.reason,
+            });
+            messages.push({ role: "user", content: buildRepairMessage(validation.reason) });
+            continue; // skip the tool-execution section below — there are no tool calls on this branch
+          }
+
+          throw new OutputValidationError(
+            `Structured output validation failed after ${repairAttempts} repair attempt(s): ${validation.reason}`,
+            { rawOutput: finalContent, attempts: repairAttempts, cause: validation.zodError }
+          );
+        }
+
         finishReason = "stop";
         break;
       }
@@ -289,7 +362,13 @@ export class Agent {
       finishReason = "max_steps";
     }
 
-    const finalResult: AgentResult = { content: finalContent, messages, finishReason, steps: step };
+    const finalResult: AgentResult & { output?: unknown } = {
+      content: finalContent,
+      messages,
+      finishReason,
+      steps: step,
+      ...(output !== undefined ? { output } : {}),
+    };
     this.emit({ type: "finish", step, result: finalResult });
     return finalResult;
   }
@@ -451,4 +530,40 @@ export class Agent {
     }
     return { blocked: false, reason: "" };
   }
+}
+
+/**
+ * Parses `raw` as JSON and validates it against `schema`. Kept as a
+ * plain function (not a method) since it's pure and doesn't need
+ * anything from `this` — matches "boilerplate is a bug": no reason to
+ * thread instance state through something with no instance dependency.
+ */
+function validateStructuredOutput(
+  schema: z.ZodTypeAny,
+  raw: string
+): { ok: true; data: unknown } | { ok: false; reason: string; zodError?: z.ZodError } {
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(raw);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `Response was not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  const result = schema.safeParse(parsedJson);
+  if (result.success) {
+    return { ok: true, data: result.data };
+  }
+
+  const issues = result.error.issues
+    .map((issue) => `- ${issue.path.join(".") || "(root)"}: ${issue.message}`)
+    .join("\n");
+
+  return {
+    ok: false,
+    reason: `Output did not match the required schema:\n${issues}`,
+    zodError: result.error,
+  };
 }

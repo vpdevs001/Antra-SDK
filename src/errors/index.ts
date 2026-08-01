@@ -97,6 +97,29 @@ export class GuardrailError extends AntraError {
   }
 }
 
+/**
+ * A structured-output run (`agent.run(query, { outputSchema })`) never
+ * produced valid output — either the model's response wasn't valid JSON,
+ * or it didn't match the schema, and the repair loop ran out of attempts
+ * (or the agent ran out of steps) before it succeeded.
+ *
+ * Thrown rather than returned, because `run()`'s typed return promises
+ * a validated `output: z.infer<TSchema>` — silently returning without
+ * one would violate that promise. This is the one place structured
+ * output always throws, regardless of any guardrail `mode` setting.
+ */
+export class OutputValidationError extends AntraError {
+  /** The raw (invalid) text the model produced on its last attempt. */
+  public readonly rawOutput: string;
+  /** How many repair attempts were made before giving up. */
+  public readonly attempts: number;
+  constructor(message: string, opts: { rawOutput: string; attempts: number; cause?: unknown }) {
+    super(message, { code: "output_validation_error", cause: opts.cause });
+    this.rawOutput = opts.rawOutput;
+    this.attempts = opts.attempts;
+  }
+}
+
 /** Catch-all for provider-side failures (5xx, malformed responses, etc). */
 export class ProviderError extends AntraError {
   public readonly statusCode: number | undefined;

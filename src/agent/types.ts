@@ -21,6 +21,7 @@ export type AgentEvent =
       mode: GuardrailMode;
       reason: string;
     }
+  | { type: "output_repair_attempted"; step: number; attempt: number; reason: string }
   | { type: "finish"; step: number; result: AgentResult };
 
 export type AgentListener = (event: AgentEvent) => void;

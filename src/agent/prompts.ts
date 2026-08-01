@@ -21,3 +21,27 @@ either calling the appropriate tool or giving your final answer.
 export function buildSystemPrompt(instructions: string, useCotNudge: boolean): string {
   return useCotNudge ? `${instructions}\n\n${COT_REASONING_NUDGE}` : instructions;
 }
+
+/**
+ * Appended to the system prompt for a single `run()` call when
+ * `outputSchema` is passed. Unlike the CoT nudge, this DOES shape
+ * control flow indirectly — the response text gets JSON.parse'd and
+ * schema-validated afterwards — but the parsing/validation itself is
+ * done with `JSON.parse` + zod, not by trusting the model to follow a
+ * hand-rolled step protocol (the POC's original mistake).
+ */
+export function buildOutputInstructions(jsonSchema: Record<string, unknown>): string {
+  return [
+    "You must respond with ONLY valid JSON matching this schema — no extra commentary, no markdown code fences, no leading/trailing text:",
+    JSON.stringify(jsonSchema, null, 2),
+  ].join("\n\n");
+}
+
+/** Builds the follow-up message sent back to the model after its output failed schema validation, asking it to correct course. */
+export function buildRepairMessage(reason: string): string {
+  return [
+    "Your previous response did not match the required output format.",
+    reason,
+    "Respond again with ONLY valid JSON matching the schema — no extra commentary, no markdown code fences.",
+  ].join("\n\n");
+}

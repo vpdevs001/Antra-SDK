@@ -38,6 +38,7 @@ export {
   CancelledError,
   ToolExecutionError,
   GuardrailError,
+  OutputValidationError,
   ProviderError,
   isAntraError,
 } from "./errors/index.js";
@@ -46,7 +47,7 @@ export { defineTool } from "./tools/define-tool.js";
 export type { Tool } from "./tools/define-tool.js";
 
 export { Agent, AgentBuilder } from "./agent/agent.js";
-export type { AgentRunOptions } from "./agent/agent.js";
+export type { AgentRunOptions, StructuredRunOptions } from "./agent/agent.js";
 export type { AgentEvent, AgentListener, AgentResult, AgentFinishReason } from "./agent/types.js";
 
 export type {
