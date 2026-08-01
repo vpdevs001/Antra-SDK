@@ -57,3 +57,8 @@ export type {
   OutputGuardrail,
   ToolGuardrail,
 } from "./guardrails/types.js";
+
+export type { SessionStore } from "./memory/session-store.js";
+export { InMemorySessionStore } from "./memory/session-store.js";
+export { FileSessionStore } from "./memory/file-session-store.js";
+export type { FileSessionStoreConfig } from "./memory/file-session-store.js";

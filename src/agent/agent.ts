@@ -17,9 +17,18 @@ import type {
   OutputGuardrail,
   ToolGuardrail,
 } from "../guardrails/types.js";
+import type { SessionStore } from "../memory/session-store.js";
+import { InMemorySessionStore } from "../memory/session-store.js";
 
 export interface AgentRunOptions {
   signal?: AbortSignal;
+  /**
+   * Continues (and persists) a conversation across separate `run()`
+   * calls. Backed by whichever SessionStore is configured via
+   * `AgentBuilder.sessionStore(...)` — an InMemorySessionStore is used
+   * automatically if none was configured.
+   */
+  sessionId?: string;
 }
 
 /** Options for a structured-output run — see Agent.run()'s second overload. */
@@ -46,6 +55,7 @@ export class AgentBuilder {
   private _inputGuardrails: GuardrailRegistration<InputGuardrail>[] = [];
   private _outputGuardrails: GuardrailRegistration<OutputGuardrail>[] = [];
   private _toolGuardrails: GuardrailRegistration<ToolGuardrail>[] = [];
+  private _sessionStore: SessionStore | undefined;
 
   /** The Antra client used to talk to the model. Required. */
   client(client: Antra): this {
@@ -135,6 +145,16 @@ export class AgentBuilder {
     return this;
   }
 
+  /**
+   * Sets the SessionStore used when `run()` is called with a `sessionId`.
+   * Optional — if never called, the Agent creates its own
+   * InMemorySessionStore automatically the first time a sessionId is used.
+   */
+  sessionStore(store: SessionStore): this {
+    this._sessionStore = store;
+    return this;
+  }
+
   build(): Agent {
     if (!this._client) {
       throw new Error("AgentBuilder: `.client(...)` is required before `.build()`.");
@@ -158,6 +178,7 @@ export class AgentBuilder {
       inputGuardrails: this._inputGuardrails,
       outputGuardrails: this._outputGuardrails,
       toolGuardrails: this._toolGuardrails,
+      sessionStore: this._sessionStore,
     };
   }
 }
@@ -173,6 +194,7 @@ export class Agent {
   private readonly inputGuardrails: GuardrailRegistration<InputGuardrail>[];
   private readonly outputGuardrails: GuardrailRegistration<OutputGuardrail>[];
   private readonly toolGuardrails: GuardrailRegistration<ToolGuardrail>[];
+  private readonly sessionStore: SessionStore;
 
   constructor(builder: AgentBuilder) {
     const config = builder._config;
@@ -184,6 +206,9 @@ export class Agent {
     this.inputGuardrails = [...config.inputGuardrails];
     this.outputGuardrails = [...config.outputGuardrails];
     this.toolGuardrails = [...config.toolGuardrails];
+    // No store configured — default to an in-memory one, scoped to this Agent instance,
+    // created once here so it actually persists across multiple run() calls on the same instance.
+    this.sessionStore = config.sessionStore ?? new InMemorySessionStore();
 
     this.toolMap = new Map(config.tools.map((t) => [t.name, t]));
     this.toolDefinitions = config.tools.map((t) => ({
@@ -233,15 +258,21 @@ export class Agent {
     query: string,
     options: AgentRunOptions & { outputSchema?: z.ZodTypeAny; maxRepairAttempts?: number } = {}
   ): Promise<AgentResult & { output?: unknown }> {
+    // --- Session state (persistent, across separate run() calls) is loaded once, up front. ---
+    const sessionId = options.sessionId;
+    const history = sessionId ? await this.sessionStore.getMessages(sessionId) : [];
+
     // --- Input guardrails run once, before anything is sent to the model. ---
     const inputCheck = await this.runInputGuardrails(0, query);
     if (inputCheck.blocked) {
+      const blockedMessages: Message[] = [...history, { role: "user", content: query }];
       const blockedResult: AgentResult = {
         content: inputCheck.reason,
-        messages: [{ role: "user", content: query }],
+        messages: blockedMessages,
         finishReason: "guardrail_blocked",
         steps: 0,
       };
+      if (sessionId) await this.sessionStore.setMessages(sessionId, blockedMessages);
       this.emit({ type: "finish", step: 0, result: blockedResult });
       return blockedResult;
     }
@@ -255,7 +286,7 @@ export class Agent {
       ? `${this.systemPrompt}\n\n${buildOutputInstructions(zodToJsonSchema(outputSchema))}`
       : this.systemPrompt;
 
-    const messages: Message[] = [{ role: "user", content: effectiveQuery }];
+    const messages: Message[] = [...history, { role: "user", content: effectiveQuery }];
     let step = 0;
     let finishReason: AgentFinishReason = "stop";
     let finalContent = "";
@@ -299,6 +330,7 @@ export class Agent {
             finishReason: "guardrail_blocked",
             steps: step,
           };
+          if (sessionId) await this.sessionStore.setMessages(sessionId, messages);
           this.emit({ type: "finish", step, result: blockedResult });
           return blockedResult;
         }
@@ -369,6 +401,7 @@ export class Agent {
       steps: step,
       ...(output !== undefined ? { output } : {}),
     };
+    if (sessionId) await this.sessionStore.setMessages(sessionId, messages);
     this.emit({ type: "finish", step, result: finalResult });
     return finalResult;
   }

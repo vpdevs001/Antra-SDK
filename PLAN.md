@@ -141,7 +141,7 @@ events (Chapter 10).
 
 ---
 
-## Chapter 7 — Structured Output
+## Chapter 7 — Structured Output ✅ _Complete_
 
 _(Assignment requirement #7: Structured Output)_
 
@@ -164,7 +164,7 @@ via the retry loop, and returns a correctly-typed, validated result.
 
 ---
 
-## Chapter 8 — Memory & Sessions
+## Chapter 8 — Memory & Sessions ✅ _Complete_
 
 _(Assignment requirement #4: Memory and Sessions)_
 
