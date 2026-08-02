@@ -20,6 +20,7 @@ import type {
 } from "../guardrails/types.js";
 import type { SessionStore } from "../memory/session-store.js";
 import { InMemorySessionStore } from "../memory/session-store.js";
+import { AsyncEventQueue } from "./event-queue.js";
 
 export interface AgentRunOptions {
   signal?: AbortSignal;
@@ -332,6 +333,58 @@ export class Agent {
   /** Registers an additional observability listener after construction. */
   onEvent(listener: AgentListener): void {
     this.listeners.push(listener);
+  }
+
+  /**
+   * Same run as `run()`, but consumed as an async iterator of
+   * `AgentEvent`s instead of (or in addition to) a callback:
+   *
+   * @example
+   * for await (const event of agent.stream("What's the weather?")) {
+   *   if (event.type === "tool_call_start") console.log("calling", event.toolCall.name);
+   *   if (event.type === "finish") console.log("done:", event.result.content);
+   * }
+   *
+   * Backed by the exact same `emit()` calls `onEvent()` listeners
+   * receive — there's one event source, just two ways to consume it.
+   * The final `AgentResult` isn't a separate return value; read it off
+   * the terminal `"finish"` event (`event.result`).
+   *
+   * Note: like `onEvent()`, listeners are shared per Agent *instance*.
+   * Two `run()`/`stream()` calls in flight at once on the same instance
+   * will each see both runs' events interleaved. For isolated
+   * concurrent runs, use separate `Agent` instances (cheap — they share
+   * no state besides an optional SessionStore) or await runs
+   * sequentially. Per-run correlation (a `runId` on every event) is
+   * planned for Chapter 11's tracing.
+   */
+  async *stream(
+    query: string,
+    options: AgentRunOptions & { outputSchema?: z.ZodTypeAny; maxRepairAttempts?: number } = {}
+  ): AsyncGenerator<AgentEvent, void, unknown> {
+    const queue = new AsyncEventQueue<AgentEvent>();
+    const listener: AgentListener = (event) => queue.push(event);
+    this.listeners.push(listener);
+
+    let runError: unknown;
+    const runPromise = this.run(query, options)
+      .catch((err: unknown) => {
+        runError = err;
+      })
+      .finally(() => {
+        const idx = this.listeners.indexOf(listener);
+        if (idx !== -1) this.listeners.splice(idx, 1);
+        queue.close();
+      });
+
+    while (true) {
+      const { value, done } = await queue.next();
+      if (done) break;
+      yield value;
+    }
+
+    await runPromise;
+    if (runError) throw runError;
   }
 
   private emit(event: AgentEvent): void {

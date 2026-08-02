@@ -222,7 +222,7 @@ and rejected rather than hanging.
 
 ---
 
-## Chapter 10 — Streaming & Events
+## Chapter 10 — Streaming & Events ✅ _Complete_
 
 _(Assignment requirement #8: Streaming and Events)_
 
