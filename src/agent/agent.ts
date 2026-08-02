@@ -1,6 +1,12 @@
 import type { z } from "zod";
 import type { Antra } from "../client.js";
-import type { Message, ContentPart, ToolDefinition, ToolCall } from "../core/types.js";
+import type {
+  Message,
+  ContentPart,
+  ToolDefinition,
+  ToolCall,
+  GenerateResult,
+} from "../core/types.js";
 import type { Tool } from "../tools/define-tool.js";
 import type { AgentEvent, AgentListener, AgentResult, AgentFinishReason } from "./types.js";
 import { buildSystemPrompt, buildOutputInstructions, buildRepairMessage } from "./prompts.js";
@@ -12,6 +18,7 @@ import {
   HandoffError,
 } from "../errors/index.js";
 import { zodToJsonSchema } from "../tools/zod-to-schema.js";
+import { accumulateStream } from "./stream-accumulator.js";
 import type {
   GuardrailRegistration,
   InputGuardrail,
@@ -40,6 +47,18 @@ export interface AgentRunOptions {
   priorMessages?: Message[];
   /** @internal Used by the handoff mechanism for loop-prevention depth tracking. Not intended for direct use. */
   handoffDepth?: number;
+  /**
+   * Opt in to real token-level streaming for this call (real
+   * `text_delta` events as the model generates, instead of one buffered
+   * chunk at the end). Default `false` — plain `run()` calls stay
+   * buffered exactly as before unless you ask for this explicitly.
+   * `agent.stream()` sets this automatically. Only takes effect when
+   * nothing needs the complete response first: has no effect if this
+   * agent has output guardrails registered, or if `outputSchema` is set
+   * for this call — both silently require buffering to work correctly,
+   * so this falls back rather than erroring.
+   */
+  streamText?: boolean;
 }
 
 let autoNameCounter = 0;
@@ -366,8 +385,14 @@ export class Agent {
     const listener: AgentListener = (event) => queue.push(event);
     this.listeners.push(listener);
 
+    // stream() implies wanting real token streaming when possible — default
+    // streamText to true here, but still respect an explicit override if
+    // the caller passed one (e.g. streamText: false to force buffering
+    // even through stream(), for some reason).
+    const runOptions = { ...options, streamText: options.streamText ?? true };
+
     let runError: unknown;
-    const runPromise = this.run(query, options)
+    const runPromise = this.run(query, runOptions)
       .catch((err: unknown) => {
         runError = err;
       })
@@ -389,6 +414,21 @@ export class Agent {
 
   private emit(event: AgentEvent): void {
     for (const listener of this.listeners) listener(event);
+  }
+
+  /**
+   * True when it's safe AND requested to stream this call's response
+   * token-by-token rather than buffering it. Requires ALL of: the
+   * caller opted in via `streamText: true`, no output guardrails
+   * registered on this agent (they need the complete text to
+   * validate/redact), and no outputSchema for this specific call (same
+   * reason — can't schema-validate a partial JSON string).
+   */
+  private canStreamText(
+    outputSchema: z.ZodTypeAny | undefined,
+    streamText: boolean | undefined
+  ): boolean {
+    return streamText === true && this.outputGuardrails.length === 0 && outputSchema === undefined;
   }
 
   /**
@@ -463,13 +503,27 @@ export class Agent {
       step++;
       this.emit({ type: "step_start", step });
 
-      const result = await this.client.generate({
+      const callOptions = {
         model: this.model,
         system: effectiveSystemPrompt,
         messages,
         ...(this.toolDefinitions.length > 0 ? { tools: this.toolDefinitions } : {}),
         ...(options.signal ? { signal: options.signal } : {}),
-      });
+      };
+
+      // Real token-level streaming is only safe when nothing needs to
+      // inspect/reject/redact the complete response before the caller
+      // sees it — an output guardrail or a structured-output schema
+      // both require the full text first. When either is configured,
+      // fall back to buffered generate() exactly as before; the caller
+      // still gets identical events, just no text_delta chunks for
+      // this call. This check is per-call (outputSchema varies per
+      // run()), not fixed at Agent construction time.
+      const result: GenerateResult = this.canStreamText(outputSchema, options.streamText)
+        ? await accumulateStream(this.client.stream(callOptions), (text) =>
+            this.emit({ type: "text_delta", step, text })
+          )
+        : await this.client.generate(callOptions);
 
       this.emit({ type: "model_response", step, result });
       finalContent = result.content;

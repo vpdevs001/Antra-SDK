@@ -13,6 +13,33 @@ function assert(condition: boolean, message: string): void {
   if (!condition) throw new Error(`Assertion failed: ${message}`);
 }
 
+function sseResponse(lines: object[]): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const line of lines)
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(line)}\n\n`));
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200 });
+}
+
+function mockStreamSequence(responderLines: Array<object[]>) {
+  let callCount = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    const lines = responderLines[callCount] ?? responderLines[responderLines.length - 1];
+    callCount++;
+    return sseResponse(lines!);
+  }) as typeof fetch;
+  return () => {
+    globalThis.fetch = originalFetch;
+  };
+}
+
+// Non-streaming mock, for the error-propagation test (never reaches the model at all).
 function mockGenerateSequence(responders: Array<(body: any) => object>) {
   let callCount = 0;
   const originalFetch = globalThis.fetch;
@@ -36,40 +63,43 @@ const getWeather = defineTool({
   execute: async ({ city }) => ({ city, tempC: 22 }),
 });
 
-// --- 1. stream() and onEvent() see the identical event sequence for the same scenario ---
+// --- 1. stream() and onEvent() see the identical event sequence for the same scenario, on identical (real-streaming) transport ---
 async function testStreamMatchesOnEventSequence() {
-  const responders: Array<(body: any) => object> = [
-    () => ({
-      choices: [
-        {
-          message: {
-            content: null,
-            tool_calls: [
-              {
-                id: "call_1",
-                type: "function",
-                function: { name: "get_weather", arguments: '{"city":"Paris"}' },
-              },
-            ],
+  const streamLines: Array<object[]> = [
+    [
+      {
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call_1",
+                  function: { name: "get_weather", arguments: '{"city":"Paris"}' },
+                },
+              ],
+            },
+            finish_reason: null,
           },
-          finish_reason: "tool_calls",
-        },
-      ],
-      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-    }),
-    () => ({
-      choices: [
-        {
-          message: { content: "It's 22°C in Paris.", tool_calls: undefined },
-          finish_reason: "stop",
-        },
-      ],
-      usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
-    }),
+        ],
+      },
+      {
+        choices: [{ delta: {}, finish_reason: "tool_calls" }],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+      },
+    ],
+    [
+      { choices: [{ delta: { content: "It's 22" }, finish_reason: null }] },
+      { choices: [{ delta: { content: "°C in Paris." }, finish_reason: null }] },
+      {
+        choices: [{ delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+      },
+    ],
   ];
 
-  // Run #1: consumed via onEvent (callback).
-  const restore1 = mockGenerateSequence(responders);
+  // Run #1: consumed via onEvent (callback), explicitly on real-streaming transport.
+  const restore1 = mockStreamSequence(streamLines);
   const eventsViaCallback: string[] = [];
   const agent1 = Agent.builder()
     .client(client)
@@ -78,11 +108,11 @@ async function testStreamMatchesOnEventSequence() {
     .tool(getWeather)
     .onEvent((e) => eventsViaCallback.push(e.type))
     .build();
-  await agent1.run("Weather in Paris?");
+  await agent1.run("Weather in Paris?", { streamText: true });
   restore1();
 
-  // Run #2: identical scenario, consumed via stream() (async iterator) instead.
-  const restore2 = mockGenerateSequence(responders);
+  // Run #2: identical scenario, consumed via stream() (async iterator) — which defaults to real-streaming transport too.
+  const restore2 = mockStreamSequence(streamLines);
   const eventsViaStream: string[] = [];
   let finalResultFromStream: any;
   const agent2 = Agent.builder()
@@ -102,10 +132,16 @@ async function testStreamMatchesOnEventSequence() {
     `event sequences differ:\n  callback: ${eventsViaCallback.join(",")}\n  stream:   ${eventsViaStream.join(",")}`
   );
   assert(
+    eventsViaStream.includes("text_delta"),
+    "expected real text_delta events on both paths — same transport, same events"
+  );
+  assert(
     finalResultFromStream.content === "It's 22°C in Paris.",
     `final result from stream's finish event is wrong: "${finalResultFromStream.content}"`
   );
-  console.log("✅ stream() and onEvent() produce identical event sequences for the same run");
+  console.log(
+    "✅ stream() and onEvent() produce identical event sequences (including real text_delta) for the same run"
+  );
   console.log(`   sequence: ${eventsViaStream.join(" → ")}`);
 }
 

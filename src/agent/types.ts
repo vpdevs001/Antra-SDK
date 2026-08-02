@@ -9,6 +9,7 @@ import type { GuardrailMode } from "../guardrails/types.js";
  */
 export type AgentEvent =
   | { type: "step_start"; step: number }
+  | { type: "text_delta"; step: number; text: string }
   | { type: "model_response"; step: number; result: GenerateResult }
   | { type: "tool_call_start"; step: number; toolCall: ToolCall }
   | { type: "tool_call_end"; step: number; toolCall: ToolCall; result: unknown }
