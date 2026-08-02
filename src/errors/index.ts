@@ -98,6 +98,24 @@ export class GuardrailError extends AntraError {
 }
 
 /**
+ * A handoff couldn't proceed — either the requested handoff would exceed
+ * `maxHandoffDepth` (loop prevention), or it targeted an agent that
+ * wasn't registered via `AgentBuilder.handoffs([...])`. Always thrown,
+ * never a soft/typed-result path — a runaway handoff chain is a
+ * structural safety limit, not content a caller should be expected to
+ * react to programmatically the way guardrail results are.
+ */
+export class HandoffError extends AntraError {
+  public readonly fromAgent: string;
+  public readonly toAgent: string;
+  constructor(message: string, opts: { fromAgent: string; toAgent: string; cause?: unknown }) {
+    super(message, { code: "handoff_error", cause: opts.cause });
+    this.fromAgent = opts.fromAgent;
+    this.toAgent = opts.toAgent;
+  }
+}
+
+/**
  * A structured-output run (`agent.run(query, { outputSchema })`) never
  * produced valid output — either the model's response wasn't valid JSON,
  * or it didn't match the schema, and the repair loop ran out of attempts

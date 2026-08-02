@@ -22,6 +22,15 @@ export type AgentEvent =
       reason: string;
     }
   | { type: "output_repair_attempted"; step: number; attempt: number; reason: string }
+  | {
+      type: "handoff_started";
+      step: number;
+      fromAgent: string;
+      toAgent: string;
+      reason: string;
+      depth: number;
+    }
+  | { type: "handoff_completed"; step: number; fromAgent: string; toAgent: string }
   | { type: "finish"; step: number; result: AgentResult };
 
 export type AgentListener = (event: AgentEvent) => void;
@@ -38,6 +47,12 @@ export interface AgentResult {
   /** Full conversation transcript, including all tool calls/results. */
   messages: import("../core/types.js").Message[];
   finishReason: AgentFinishReason;
-  /** Number of model round-trips actually taken. */
+  /** Number of model round-trips actually taken (by whichever agent produced the final answer, after any handoffs). */
   steps: number;
+  /**
+   * Sequence of agent names this run passed through, in order, e.g.
+   * `["router", "billing-specialist"]`. Only present when at least one
+   * handoff occurred — absent on a normal single-agent run.
+   */
+  handoffChain?: string[];
 }

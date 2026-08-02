@@ -194,7 +194,7 @@ agent-calling code.
 
 ---
 
-## Chapter 9 — Handoffs
+## Chapter 9 — Handoffs ✅ _Complete_
 
 _(Assignment requirement #5: Handoffs)_
 

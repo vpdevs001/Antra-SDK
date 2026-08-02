@@ -39,6 +39,7 @@ export {
   ToolExecutionError,
   GuardrailError,
   OutputValidationError,
+  HandoffError,
   ProviderError,
   isAntraError,
 } from "./errors/index.js";

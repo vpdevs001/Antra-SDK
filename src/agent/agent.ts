@@ -9,6 +9,7 @@ import {
   CancelledError,
   GuardrailError,
   OutputValidationError,
+  HandoffError,
 } from "../errors/index.js";
 import { zodToJsonSchema } from "../tools/zod-to-schema.js";
 import type {
@@ -29,6 +30,22 @@ export interface AgentRunOptions {
    * automatically if none was configured.
    */
   sessionId?: string;
+  /**
+   * @internal Used by the handoff mechanism to seed the target agent
+   * with the full prior conversation transcript. Not intended for
+   * direct use — pass conversation history via `sessionId` instead for
+   * normal multi-turn use.
+   */
+  priorMessages?: Message[];
+  /** @internal Used by the handoff mechanism for loop-prevention depth tracking. Not intended for direct use. */
+  handoffDepth?: number;
+}
+
+let autoNameCounter = 0;
+/** Fallback name for agents that don't call `.name(...)` — handoffs work fine with these, just less readably. */
+function generateAgentName(): string {
+  autoNameCounter++;
+  return `agent-${autoNameCounter}`;
 }
 
 /** Options for a structured-output run — see Agent.run()'s second overload. */
@@ -47,6 +64,7 @@ export interface StructuredRunOptions<TSchema extends z.ZodTypeAny> extends Agen
 export class AgentBuilder {
   private _client: Antra | undefined;
   private _model: string | undefined;
+  private _name: string | undefined;
   private _instructions = "";
   private _tools: Tool[] = [];
   private _maxSteps = 10;
@@ -56,6 +74,8 @@ export class AgentBuilder {
   private _outputGuardrails: GuardrailRegistration<OutputGuardrail>[] = [];
   private _toolGuardrails: GuardrailRegistration<ToolGuardrail>[] = [];
   private _sessionStore: SessionStore | undefined;
+  private _handoffs: Agent[] = [];
+  private _maxHandoffDepth = 5;
 
   /** The Antra client used to talk to the model. Required. */
   client(client: Antra): this {
@@ -66,6 +86,18 @@ export class AgentBuilder {
   /** Which model to call, e.g. "gpt-4o". Required. */
   model(model: string): this {
     this._model = model;
+    return this;
+  }
+
+  /**
+   * A readable name for this agent. Optional, but strongly recommended
+   * once you're using handoffs — it's how other agents' handoff tools
+   * are labeled (`handoff_to_<name>`) and how this agent shows up in
+   * `handoffChain` and handoff events. Auto-generated (`agent-1`,
+   * `agent-2`, ...) if omitted.
+   */
+  name(name: string): this {
+    this._name = name;
     return this;
   }
 
@@ -155,6 +187,30 @@ export class AgentBuilder {
     return this;
   }
 
+  /**
+   * Registers other agents this agent can delegate to. Each registered
+   * agent is exposed to the model as a `handoff_to_<name>` tool — the
+   * model requests a handoff the same way it requests any other tool
+   * call, through the native tool-calling path (Chapter 3), not a
+   * separate mechanism.
+   */
+  handoffs(agents: Agent[]): this {
+    this._handoffs.push(...agents);
+    return this;
+  }
+
+  /**
+   * Loop-prevention limit: the maximum number of handoff hops allowed
+   * in a single run, checked by whichever agent is about to perform the
+   * next handoff. Default 5. Exceeding it throws HandoffError rather
+   * than silently truncating — a runaway handoff chain is a bug to
+   * surface, not paper over.
+   */
+  maxHandoffDepth(max: number): this {
+    this._maxHandoffDepth = max;
+    return this;
+  }
+
   build(): Agent {
     if (!this._client) {
       throw new Error("AgentBuilder: `.client(...)` is required before `.build()`.");
@@ -170,6 +226,7 @@ export class AgentBuilder {
     return {
       client: this._client!,
       model: this._model!,
+      name: this._name ?? generateAgentName(),
       instructions: this._instructions,
       tools: this._tools,
       maxSteps: this._maxSteps,
@@ -179,11 +236,15 @@ export class AgentBuilder {
       outputGuardrails: this._outputGuardrails,
       toolGuardrails: this._toolGuardrails,
       sessionStore: this._sessionStore,
+      handoffs: this._handoffs,
+      maxHandoffDepth: this._maxHandoffDepth,
     };
   }
 }
 
 export class Agent {
+  /** Readable name — used to build handoff tool names, populate handoffChain, and label handoff events. */
+  public readonly name: string;
   private readonly client: Antra;
   private readonly model: string;
   private readonly systemPrompt: string;
@@ -195,11 +256,15 @@ export class Agent {
   private readonly outputGuardrails: GuardrailRegistration<OutputGuardrail>[];
   private readonly toolGuardrails: GuardrailRegistration<ToolGuardrail>[];
   private readonly sessionStore: SessionStore;
+  /** Maps a handoff tool name (e.g. "handoff_to_billing") to the target Agent. */
+  private readonly handoffMap: Map<string, Agent>;
+  private readonly maxHandoffDepth: number;
 
   constructor(builder: AgentBuilder) {
     const config = builder._config;
     this.client = config.client;
     this.model = config.model;
+    this.name = config.name;
     this.systemPrompt = buildSystemPrompt(config.instructions, config.useCotNudge);
     this.maxSteps = config.maxSteps;
     this.listeners = [...config.listeners];
@@ -209,13 +274,55 @@ export class Agent {
     // No store configured — default to an in-memory one, scoped to this Agent instance,
     // created once here so it actually persists across multiple run() calls on the same instance.
     this.sessionStore = config.sessionStore ?? new InMemorySessionStore();
+    this.maxHandoffDepth = config.maxHandoffDepth;
 
     this.toolMap = new Map(config.tools.map((t) => [t.name, t]));
-    this.toolDefinitions = config.tools.map((t) => ({
+    const toolDefs: ToolDefinition[] = config.tools.map((t) => ({
       name: t.name,
       description: t.description,
       parameters: t.parameters,
     }));
+
+    this.handoffMap = new Map();
+    this.toolDefinitions = toolDefs;
+    for (const target of config.handoffs) {
+      this.registerHandoffTarget(target);
+    }
+  }
+
+  /**
+   * Registers a handoff target after construction. Exists because two
+   * agents that can hand off to *each other* can't both be passed to
+   * `.handoffs([...])` in the builder — neither instance exists yet
+   * when the other is being built. Build both agents normally, then
+   * wire the cycle with `agentA.addHandoff(agentB)` / `agentB.addHandoff(agentA)`.
+   */
+  addHandoff(target: Agent): void {
+    this.registerHandoffTarget(target);
+  }
+
+  private registerHandoffTarget(target: Agent): void {
+    // Each registered handoff target gets its own synthetic tool
+    // definition — `handoff_to_<name>` — so the model requests a
+    // handoff through the exact same native tool-calling path as any
+    // other tool (Chapter 3), rather than a bespoke mechanism.
+    const toolName = `handoff_to_${sanitizeToolName(target.name)}`;
+    this.handoffMap.set(toolName, target);
+    this.toolDefinitions.push({
+      name: toolName,
+      description: `Transfer this conversation to the "${target.name}" agent. Use this when the user's request is better handled by that agent instead of you.`,
+      parameters: {
+        type: "object",
+        properties: {
+          reason: {
+            type: "string",
+            description:
+              "Why you're handing off, and what the next agent should do — this is shown to the target agent as its instruction to continue.",
+          },
+        },
+        required: ["reason"],
+      },
+    });
   }
 
   static builder(): AgentBuilder {
@@ -258,9 +365,11 @@ export class Agent {
     query: string,
     options: AgentRunOptions & { outputSchema?: z.ZodTypeAny; maxRepairAttempts?: number } = {}
   ): Promise<AgentResult & { output?: unknown }> {
-    // --- Session state (persistent, across separate run() calls) is loaded once, up front. ---
+    // --- Session state (persistent, across separate run() calls) is loaded once, up front.
+    // Combined with any priorMessages seeded by the handoff mechanism, if this run is a handoff continuation. ---
     const sessionId = options.sessionId;
-    const history = sessionId ? await this.sessionStore.getMessages(sessionId) : [];
+    const sessionHistory = sessionId ? await this.sessionStore.getMessages(sessionId) : [];
+    const history = [...sessionHistory, ...(options.priorMessages ?? [])];
 
     // --- Input guardrails run once, before anything is sent to the model. ---
     const inputCheck = await this.runInputGuardrails(0, query);
@@ -319,6 +428,16 @@ export class Agent {
         assistantContent.push({ type: "tool_call", id: tc.id, name: tc.name, args: tc.args });
       }
       messages.push({ role: "assistant", content: assistantContent });
+
+      // Handoff detection takes priority over both the "final answer" and
+      // normal tool-execution paths — if the model requested a handoff,
+      // control transfers to the target agent immediately. (If the model
+      // bundled other tool calls in with the handoff call, they're
+      // deliberately not executed — the handoff wins outright.)
+      const handoffCall = result.toolCalls.find((tc) => this.handoffMap.has(tc.name));
+      if (handoffCall) {
+        return await this.performHandoff(step, handoffCall, messages, options);
+      }
 
       if (result.finishReason !== "tool_calls" || result.toolCalls.length === 0) {
         // --- Output guardrails run only on a genuine final answer, never on intermediate turns. ---
@@ -413,6 +532,67 @@ export class Agent {
    * it becomes information the model can react to (retry differently,
    * apologize to the user, try another tool, etc).
    */
+  /**
+   * Transfers control to `target`, preserving the full conversation
+   * transcript so far. Enforces `maxHandoffDepth` as a hard limit
+   * (throws HandoffError rather than truncating) and emits
+   * handoff_started/handoff_completed for tracing.
+   */
+  private async performHandoff(
+    step: number,
+    toolCall: ToolCall,
+    messages: Message[],
+    options: AgentRunOptions
+  ): Promise<AgentResult & { output?: unknown }> {
+    // Membership in handoffMap is how this method gets called, so this should never happen —
+    // but keep it typed and defensive rather than a non-null assertion.
+    const target = this.handoffMap.get(toolCall.name);
+    if (!target) {
+      throw new HandoffError(`No handoff target registered for tool "${toolCall.name}".`, {
+        fromAgent: this.name,
+        toAgent: toolCall.name,
+      });
+    }
+
+    const currentDepth = options.handoffDepth ?? 0;
+    const nextDepth = currentDepth + 1;
+    if (nextDepth > this.maxHandoffDepth) {
+      throw new HandoffError(
+        `Handoff from "${this.name}" to "${target.name}" would exceed maxHandoffDepth (${this.maxHandoffDepth}). This usually means two or more agents are handing off to each other in a loop.`,
+        { fromAgent: this.name, toAgent: target.name }
+      );
+    }
+
+    const args = toolCall.args as { reason?: unknown } | undefined;
+    const reason =
+      typeof args?.reason === "string" && args.reason.length > 0 ? args.reason : "No reason given.";
+
+    this.emit({
+      type: "handoff_started",
+      step,
+      fromAgent: this.name,
+      toAgent: target.name,
+      reason,
+      depth: nextDepth,
+    });
+
+    const targetResult = await target.run(`[Handoff from "${this.name}"]: ${reason}`, {
+      ...(options.signal ? { signal: options.signal } : {}),
+      priorMessages: messages,
+      handoffDepth: nextDepth,
+    });
+
+    this.emit({ type: "handoff_completed", step, fromAgent: this.name, toAgent: target.name });
+
+    // If the target itself handed off further, its own handoffChain already
+    // starts with its name — prepend ours. Otherwise this is the first hop.
+    const handoffChain = targetResult.handoffChain
+      ? [this.name, ...targetResult.handoffChain]
+      : [this.name, target.name];
+
+    return { ...targetResult, handoffChain };
+  }
+
   private async executeTool(
     step: number,
     toolCall: ToolCall
@@ -563,6 +743,11 @@ export class Agent {
     }
     return { blocked: false, reason: "" };
   }
+}
+
+/** Keeps generated handoff tool names within the character set most providers expect for tool/function names. */
+function sanitizeToolName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 
 /**
