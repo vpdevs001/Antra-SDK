@@ -247,7 +247,7 @@ test.
 
 ---
 
-## Chapter 11 — Tracing & Reliability
+## Chapter 11 — Tracing & Reliability ✅ _Complete_
 
 _(Assignment requirement #9: Tracing and Reliability, plus the deferred
 retries/backoff from the original plan's Chapter 9)_

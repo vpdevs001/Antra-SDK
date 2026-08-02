@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { z } from "zod";
 import type { Antra } from "../client.js";
 import type {
@@ -28,6 +29,10 @@ import type {
 import type { SessionStore } from "../memory/session-store.js";
 import { InMemorySessionStore } from "../memory/session-store.js";
 import { AsyncEventQueue } from "./event-queue.js";
+import type { Trace } from "./trace.js";
+import { createTrace, addUsage, finalizeTrace } from "./trace.js";
+import type { RetryConfig } from "./retry.js";
+import { DEFAULT_RETRY_CONFIG, withRetry } from "./retry.js";
 
 export interface AgentRunOptions {
   signal?: AbortSignal;
@@ -59,6 +64,10 @@ export interface AgentRunOptions {
    * so this falls back rather than erroring.
    */
   streamText?: boolean;
+  /** @internal Used by the handoff mechanism to keep one coherent runId across a handoff chain, instead of each hop minting its own. */
+  runId?: string;
+  /** @internal Used by the handoff mechanism so the whole chain writes into the SAME Trace object rather than fragmenting into one trace per hop. */
+  trace?: Trace;
 }
 
 let autoNameCounter = 0;
@@ -96,6 +105,10 @@ export class AgentBuilder {
   private _sessionStore: SessionStore | undefined;
   private _handoffs: Agent[] = [];
   private _maxHandoffDepth = 5;
+  private _retryConfig: RetryConfig = DEFAULT_RETRY_CONFIG;
+  private _maxTokens: number | undefined;
+  private _maxDurationMs: number | undefined;
+  private _maxStoredTraces = 100;
 
   /** The Antra client used to talk to the model. Required. */
   client(client: Antra): this {
@@ -231,6 +244,49 @@ export class AgentBuilder {
     return this;
   }
 
+  /**
+   * Configures automatic retry-with-backoff for transient provider
+   * errors (rate limits, 5xx-class provider errors, timeouts) on every
+   * model call this agent makes. Partial config — unspecified fields
+   * keep the defaults (3 attempts, 500ms initial delay, 8s cap, 2x
+   * multiplier). Respects `RateLimitError.retryAfterMs` when a provider
+   * supplies it, rather than guessing.
+   */
+  retry(config: Partial<RetryConfig>): this {
+    this._retryConfig = { ...this._retryConfig, ...config };
+    return this;
+  }
+
+  /**
+   * Run-level limit: if accumulated token usage (across all steps, all
+   * model calls) reaches this, the run stops gracefully with
+   * finishReason "limit_exceeded" rather than continuing indefinitely.
+   * Checked at step boundaries, so a single very large response can
+   * still exceed this before it's caught — it's a backstop, not a
+   * hard per-request cap.
+   */
+  maxTokens(max: number): this {
+    this._maxTokens = max;
+    return this;
+  }
+
+  /**
+   * Run-level limit: if wall-clock time since the run started exceeds
+   * this (in ms), the run stops gracefully with finishReason
+   * "limit_exceeded". Checked at step boundaries, same caveat as
+   * maxTokens — a single slow call can still push past this.
+   */
+  maxDurationMs(max: number): this {
+    this._maxDurationMs = max;
+    return this;
+  }
+
+  /** How many completed run traces to keep in memory for `agent.getTrace(runId)` lookups. Oldest evicted first. Default 100. */
+  maxStoredTraces(max: number): this {
+    this._maxStoredTraces = max;
+    return this;
+  }
+
   build(): Agent {
     if (!this._client) {
       throw new Error("AgentBuilder: `.client(...)` is required before `.build()`.");
@@ -258,6 +314,10 @@ export class AgentBuilder {
       sessionStore: this._sessionStore,
       handoffs: this._handoffs,
       maxHandoffDepth: this._maxHandoffDepth,
+      retryConfig: this._retryConfig,
+      maxTokens: this._maxTokens,
+      maxDurationMs: this._maxDurationMs,
+      maxStoredTraces: this._maxStoredTraces,
     };
   }
 }
@@ -279,6 +339,11 @@ export class Agent {
   /** Maps a handoff tool name (e.g. "handoff_to_billing") to the target Agent. */
   private readonly handoffMap: Map<string, Agent>;
   private readonly maxHandoffDepth: number;
+  private readonly retryConfig: RetryConfig;
+  private readonly maxTokens: number | undefined;
+  private readonly maxDurationMs: number | undefined;
+  private readonly maxStoredTraces: number;
+  private readonly traces: Map<string, Trace> = new Map();
 
   constructor(builder: AgentBuilder) {
     const config = builder._config;
@@ -295,6 +360,10 @@ export class Agent {
     // created once here so it actually persists across multiple run() calls on the same instance.
     this.sessionStore = config.sessionStore ?? new InMemorySessionStore();
     this.maxHandoffDepth = config.maxHandoffDepth;
+    this.retryConfig = config.retryConfig;
+    this.maxTokens = config.maxTokens;
+    this.maxDurationMs = config.maxDurationMs;
+    this.maxStoredTraces = config.maxStoredTraces;
 
     this.toolMap = new Map(config.tools.map((t) => [t.name, t]));
     const toolDefs: ToolDefinition[] = config.tools.map((t) => ({
@@ -355,6 +424,25 @@ export class Agent {
   }
 
   /**
+   * Looks up a completed (or in-progress) run's Trace by its runId.
+   * Works for any runId this Agent instance participated in — including
+   * as a handoff target, since the same Trace object is shared across a
+   * handoff chain. Returns undefined if the runId is unknown or its
+   * trace has since been evicted (see `AgentBuilder.maxStoredTraces`).
+   */
+  getTrace(runId: string): Trace | undefined {
+    return this.traces.get(runId);
+  }
+
+  private storeTrace(trace: Trace): void {
+    this.traces.set(trace.runId, trace);
+    if (this.traces.size > this.maxStoredTraces) {
+      const oldestKey = this.traces.keys().next().value;
+      if (oldestKey !== undefined) this.traces.delete(oldestKey);
+    }
+  }
+
+  /**
    * Same run as `run()`, but consumed as an async iterator of
    * `AgentEvent`s instead of (or in addition to) a callback:
    *
@@ -371,11 +459,9 @@ export class Agent {
    *
    * Note: like `onEvent()`, listeners are shared per Agent *instance*.
    * Two `run()`/`stream()` calls in flight at once on the same instance
-   * will each see both runs' events interleaved. For isolated
-   * concurrent runs, use separate `Agent` instances (cheap — they share
-   * no state besides an optional SessionStore) or await runs
-   * sequentially. Per-run correlation (a `runId` on every event) is
-   * planned for Chapter 11's tracing.
+   * will each see both runs' events interleaved — filter on
+   * `event.runId` if you need to isolate one run's events from another
+   * sharing the same instance.
    */
   async *stream(
     query: string,
@@ -458,6 +544,12 @@ export class Agent {
     query: string,
     options: AgentRunOptions & { outputSchema?: z.ZodTypeAny; maxRepairAttempts?: number } = {}
   ): Promise<AgentResult & { output?: unknown }> {
+    // --- runId + Trace: reused across a handoff chain (via options.runId/options.trace),
+    // freshly minted for a top-level call. ---
+    const runId = options.runId ?? randomUUID();
+    const trace = options.trace ?? createTrace(runId, this.name);
+    if (!trace.agentNames.includes(this.name)) trace.agentNames.push(this.name);
+
     // --- Session state (persistent, across separate run() calls) is loaded once, up front.
     // Combined with any priorMessages seeded by the handoff mechanism, if this run is a handoff continuation. ---
     const sessionId = options.sessionId;
@@ -465,17 +557,21 @@ export class Agent {
     const history = [...sessionHistory, ...(options.priorMessages ?? [])];
 
     // --- Input guardrails run once, before anything is sent to the model. ---
-    const inputCheck = await this.runInputGuardrails(0, query);
+    const inputCheck = await this.runInputGuardrails(runId, 0, query);
     if (inputCheck.blocked) {
       const blockedMessages: Message[] = [...history, { role: "user", content: query }];
+      finalizeTrace(trace, inputCheck.reason, "guardrail_blocked");
+      this.storeTrace(trace);
       const blockedResult: AgentResult = {
+        runId,
         content: inputCheck.reason,
         messages: blockedMessages,
         finishReason: "guardrail_blocked",
         steps: 0,
+        trace,
       };
       if (sessionId) await this.sessionStore.setMessages(sessionId, blockedMessages);
-      this.emit({ type: "finish", step: 0, result: blockedResult });
+      this.emit({ type: "finish", runId, step: 0, result: blockedResult });
       return blockedResult;
     }
     const effectiveQuery = inputCheck.modifiedValue ?? query;
@@ -500,8 +596,18 @@ export class Agent {
         break;
       }
 
+      // --- Run-level limits, checked at each step boundary (a backstop, not a hard per-request cap). ---
+      if (this.maxTokens !== undefined && trace.totalUsage.totalTokens >= this.maxTokens) {
+        finishReason = "limit_exceeded";
+        break;
+      }
+      if (this.maxDurationMs !== undefined && Date.now() - trace.startedAt >= this.maxDurationMs) {
+        finishReason = "limit_exceeded";
+        break;
+      }
+
       step++;
-      this.emit({ type: "step_start", step });
+      this.emit({ type: "step_start", runId, step });
 
       const callOptions = {
         model: this.model,
@@ -519,13 +625,65 @@ export class Agent {
       // still gets identical events, just no text_delta chunks for
       // this call. This check is per-call (outputSchema varies per
       // run()), not fixed at Agent construction time.
-      const result: GenerateResult = this.canStreamText(outputSchema, options.streamText)
-        ? await accumulateStream(this.client.stream(callOptions), (text) =>
-            this.emit({ type: "text_delta", step, text })
-          )
-        : await this.client.generate(callOptions);
+      const streamed = this.canStreamText(outputSchema, options.streamText);
+      const callStartedAt = Date.now();
+      const { result, retries } = await withRetry(
+        () =>
+          streamed
+            ? accumulateStream(this.client.stream(callOptions), (text) =>
+                this.emit({ type: "text_delta", runId, step, text })
+              )
+            : this.client.generate(callOptions),
+        this.retryConfig,
+        (attempt, delayMs, error) => {
+          const code =
+            error instanceof Error && "code" in error
+              ? String((error as { code: unknown }).code)
+              : "unknown";
+          const message = error instanceof Error ? error.message : String(error);
+          trace.retries.push({
+            step,
+            agentName: this.name,
+            attempt,
+            delayMs,
+            errorCode: code,
+            errorMessage: message,
+          });
+          this.emit({
+            type: "retry_attempted",
+            runId,
+            step,
+            attempt,
+            delayMs,
+            errorCode: code,
+            errorMessage: message,
+          });
+        }
+      );
+      const callDurationMs = Date.now() - callStartedAt;
 
-      this.emit({ type: "model_response", step, result });
+      trace.modelCalls.push({
+        step,
+        agentName: this.name,
+        model: this.model,
+        startedAt: callStartedAt,
+        durationMs: callDurationMs,
+        usage: result.usage,
+        finishReason: result.finishReason,
+        streamed,
+        retries,
+      });
+      addUsage(trace, result.usage);
+
+      this.emit({
+        type: "model_response",
+        runId,
+        step,
+        result,
+        durationMs: callDurationMs,
+        retries,
+        streamed,
+      });
       finalContent = result.content;
 
       // Append the assistant's turn to history — text and/or tool calls.
@@ -543,21 +701,25 @@ export class Agent {
       // deliberately not executed — the handoff wins outright.)
       const handoffCall = result.toolCalls.find((tc) => this.handoffMap.has(tc.name));
       if (handoffCall) {
-        return await this.performHandoff(step, handoffCall, messages, options);
+        return await this.performHandoff(runId, trace, step, handoffCall, messages, options);
       }
 
       if (result.finishReason !== "tool_calls" || result.toolCalls.length === 0) {
         // --- Output guardrails run only on a genuine final answer, never on intermediate turns. ---
-        const outputCheck = await this.runOutputGuardrails(step, finalContent);
+        const outputCheck = await this.runOutputGuardrails(runId, step, finalContent);
         if (outputCheck.blocked) {
+          finalizeTrace(trace, outputCheck.reason, "guardrail_blocked");
+          this.storeTrace(trace);
           const blockedResult: AgentResult = {
+            runId,
             content: outputCheck.reason,
             messages,
             finishReason: "guardrail_blocked",
             steps: step,
+            trace,
           };
           if (sessionId) await this.sessionStore.setMessages(sessionId, messages);
-          this.emit({ type: "finish", step, result: blockedResult });
+          this.emit({ type: "finish", runId, step, result: blockedResult });
           return blockedResult;
         }
         finalContent = outputCheck.modifiedValue ?? finalContent;
@@ -575,6 +737,7 @@ export class Agent {
             repairAttempts++;
             this.emit({
               type: "output_repair_attempted",
+              runId,
               step,
               attempt: repairAttempts,
               reason: validation.reason,
@@ -583,6 +746,9 @@ export class Agent {
             continue; // skip the tool-execution section below — there are no tool calls on this branch
           }
 
+          trace.errors.push({ step, code: "output_validation_error", message: validation.reason });
+          finalizeTrace(trace, finalContent, "stop");
+          this.storeTrace(trace);
           throw new OutputValidationError(
             `Structured output validation failed after ${repairAttempts} repair attempt(s): ${validation.reason}`,
             { rawOutput: finalContent, attempts: repairAttempts, cause: validation.zodError }
@@ -596,7 +762,7 @@ export class Agent {
       // Execute every requested tool call, feed results back, then loop again.
       const toolResultParts: ContentPart[] = [];
       for (const toolCall of result.toolCalls) {
-        const toolResult = await this.executeTool(step, toolCall);
+        const toolResult = await this.executeTool(runId, trace, step, toolCall);
         toolResultParts.push({
           type: "tool_result",
           toolCallId: toolCall.id,
@@ -620,32 +786,34 @@ export class Agent {
       finishReason = "max_steps";
     }
 
+    finalizeTrace(trace, finalContent, finishReason);
+    this.storeTrace(trace);
+
     const finalResult: AgentResult & { output?: unknown } = {
+      runId,
       content: finalContent,
       messages,
       finishReason,
       steps: step,
+      trace,
       ...(output !== undefined ? { output } : {}),
     };
     if (sessionId) await this.sessionStore.setMessages(sessionId, messages);
-    this.emit({ type: "finish", step, result: finalResult });
+    this.emit({ type: "finish", runId, step, result: finalResult });
     return finalResult;
   }
 
   /**
-   * Validates tool args against the tool's zod schema, executes it, and
-   * normalizes both success and failure into a tool_result so the model
-   * always gets a response — a failed tool call doesn't crash the run,
-   * it becomes information the model can react to (retry differently,
-   * apologize to the user, try another tool, etc).
-   */
-  /**
    * Transfers control to `target`, preserving the full conversation
    * transcript so far. Enforces `maxHandoffDepth` as a hard limit
    * (throws HandoffError rather than truncating) and emits
-   * handoff_started/handoff_completed for tracing.
+   * handoff_started/handoff_completed for tracing. The SAME runId and
+   * Trace object are threaded through to `target.run()`, so the whole
+   * chain shows up as one coherent trace, not one per agent.
    */
   private async performHandoff(
+    runId: string,
+    trace: Trace,
     step: number,
     toolCall: ToolCall,
     messages: Message[],
@@ -674,8 +842,16 @@ export class Agent {
     const reason =
       typeof args?.reason === "string" && args.reason.length > 0 ? args.reason : "No reason given.";
 
+    trace.handoffs.push({
+      step,
+      fromAgent: this.name,
+      toAgent: target.name,
+      reason,
+      depth: nextDepth,
+    });
     this.emit({
       type: "handoff_started",
+      runId,
       step,
       fromAgent: this.name,
       toAgent: target.name,
@@ -687,9 +863,23 @@ export class Agent {
       ...(options.signal ? { signal: options.signal } : {}),
       priorMessages: messages,
       handoffDepth: nextDepth,
+      runId,
+      trace,
     });
 
-    this.emit({ type: "handoff_completed", step, fromAgent: this.name, toAgent: target.name });
+    this.emit({
+      type: "handoff_completed",
+      runId,
+      step,
+      fromAgent: this.name,
+      toAgent: target.name,
+    });
+
+    // performHandoff returns directly, bypassing run()'s normal
+    // trace-storing code at the bottom of the function — store it here
+    // too so THIS agent's own getTrace(runId) also finds it (it's the
+    // same object reference the target already finalized/stored).
+    this.storeTrace(trace);
 
     // If the target itself handed off further, its own handoffChain already
     // starts with its name — prepend ours. Otherwise this is the first hop.
@@ -700,32 +890,53 @@ export class Agent {
     return { ...targetResult, handoffChain };
   }
 
+  /**
+   * Validates tool args against the tool's zod schema, executes it, and
+   * normalizes both success and failure into a tool_result so the model
+   * always gets a response — a failed tool call doesn't crash the run,
+   * it becomes information the model can react to (retry differently,
+   * apologize to the user, try another tool, etc).
+   */
   private async executeTool(
+    runId: string,
+    trace: Trace,
     step: number,
     toolCall: ToolCall
   ): Promise<{ value: unknown; isError: boolean }> {
+    const startedAt = Date.now();
+    const record = (isError: boolean) => {
+      trace.toolCalls.push({
+        step,
+        toolName: toolCall.name,
+        durationMs: Date.now() - startedAt,
+        isError,
+      });
+    };
+
     const tool = this.toolMap.get(toolCall.name);
 
     if (!tool) {
       const error = new ToolExecutionError(`No tool registered with name "${toolCall.name}"`, {
         toolName: toolCall.name,
       });
-      this.emit({ type: "tool_call_error", step, toolCall, error });
+      record(true);
+      this.emit({ type: "tool_call_error", runId, step, toolCall, error });
       return { value: { error: error.message }, isError: true };
     }
 
-    this.emit({ type: "tool_call_start", step, toolCall });
+    this.emit({ type: "tool_call_start", runId, step, toolCall });
 
     // Tool guardrails run before schema validation or execution — they can
     // reject a call outright (e.g. a dangerous command, a disallowed
     // recipient) regardless of whether its arguments are well-formed.
-    const toolCheck = await this.runToolGuardrails(step, toolCall);
+    const toolCheck = await this.runToolGuardrails(runId, step, toolCall);
     if (toolCheck.blocked) {
       const error = new ToolExecutionError(
         `Tool call "${toolCall.name}" blocked by guardrail: ${toolCheck.reason}`,
         { toolName: toolCall.name }
       );
-      this.emit({ type: "tool_call_error", step, toolCall, error });
+      record(true);
+      this.emit({ type: "tool_call_error", runId, step, toolCall, error });
       return { value: { error: error.message }, isError: true };
     }
 
@@ -735,13 +946,15 @@ export class Agent {
         `Invalid arguments for tool "${toolCall.name}": ${parsed.error.message}`,
         { toolName: toolCall.name, cause: parsed.error }
       );
-      this.emit({ type: "tool_call_error", step, toolCall, error });
+      record(true);
+      this.emit({ type: "tool_call_error", runId, step, toolCall, error });
       return { value: { error: error.message }, isError: true };
     }
 
     try {
       const value = await tool.execute(parsed.data);
-      this.emit({ type: "tool_call_end", step, toolCall, result: value });
+      record(false);
+      this.emit({ type: "tool_call_end", runId, step, toolCall, result: value });
       return { value, isError: false };
     } catch (cause) {
       const error =
@@ -751,7 +964,8 @@ export class Agent {
               `Tool "${toolCall.name}" threw during execution: ${cause instanceof Error ? cause.message : String(cause)}`,
               { toolName: toolCall.name, cause }
             );
-      this.emit({ type: "tool_call_error", step, toolCall, error });
+      record(true);
+      this.emit({ type: "tool_call_error", runId, step, toolCall, error });
       return { value: { error: error.message }, isError: true };
     }
   }
@@ -764,6 +978,7 @@ export class Agent {
   // it (a thrown error always propagates out of run(), full stop).
 
   private async runInputGuardrails(
+    runId: string,
     step: number,
     input: string
   ): Promise<{ blocked: boolean; reason: string; modifiedValue?: string }> {
@@ -774,6 +989,7 @@ export class Agent {
         const reason = result.reason ?? "Input guardrail rejected the input.";
         this.emit({
           type: "guardrail_triggered",
+          runId,
           step,
           guardrailType: "input",
           guardrailName: reg.name,
@@ -794,6 +1010,7 @@ export class Agent {
   }
 
   private async runOutputGuardrails(
+    runId: string,
     step: number,
     output: string
   ): Promise<{ blocked: boolean; reason: string; modifiedValue?: string }> {
@@ -804,6 +1021,7 @@ export class Agent {
         const reason = result.reason ?? "Output guardrail rejected the response.";
         this.emit({
           type: "guardrail_triggered",
+          runId,
           step,
           guardrailType: "output",
           guardrailName: reg.name,
@@ -824,6 +1042,7 @@ export class Agent {
   }
 
   private async runToolGuardrails(
+    runId: string,
     step: number,
     toolCall: ToolCall
   ): Promise<{ blocked: boolean; reason: string }> {
@@ -833,6 +1052,7 @@ export class Agent {
         const reason = result.reason ?? `Tool guardrail rejected the call to "${toolCall.name}".`;
         this.emit({
           type: "guardrail_triggered",
+          runId,
           step,
           guardrailType: "tool",
           guardrailName: reg.name,

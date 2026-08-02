@@ -50,6 +50,15 @@ export type { Tool } from "./tools/define-tool.js";
 export { Agent, AgentBuilder } from "./agent/agent.js";
 export type { AgentRunOptions, StructuredRunOptions } from "./agent/agent.js";
 export type { AgentEvent, AgentListener, AgentResult, AgentFinishReason } from "./agent/types.js";
+export type {
+  Trace,
+  TraceModelCall,
+  TraceToolCall,
+  TraceHandoff,
+  TraceRetry,
+  TraceError,
+} from "./agent/trace.js";
+export type { RetryConfig } from "./agent/retry.js";
 
 export type {
   GuardrailMode,
