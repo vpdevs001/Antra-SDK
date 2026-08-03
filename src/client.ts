@@ -31,10 +31,24 @@ export interface FallbackConfig {
   providers: ProviderSpec[];
 }
 
-export type AntraConfig = SingleProviderConfig | FallbackConfig;
+/**
+ * Direct-injection config — pass any object implementing the `Provider`
+ * interface (e.g. `MockProvider` for testing, or your own custom
+ * provider). No `apiKey` involved here; whatever you pass in owns its
+ * own auth, if it needs any.
+ */
+export interface CustomProviderConfig {
+  provider: Provider;
+}
+
+export type AntraConfig = SingleProviderConfig | FallbackConfig | CustomProviderConfig;
 
 function isFallbackConfig(config: AntraConfig): config is FallbackConfig {
   return "providers" in config;
+}
+
+function isCustomProviderConfig(config: AntraConfig): config is CustomProviderConfig {
+  return "provider" in config && typeof config.provider === "object";
 }
 
 /** Per-call options, minus what's already fixed at the Client level. */
@@ -72,11 +86,19 @@ function createProvider(spec: { provider: ProviderName } & BaseProviderConfig): 
  *     { provider: "anthropic", apiKey: ANTHROPIC_KEY, model: "claude-3-5-sonnet-latest" },
  *   ],
  * });
+ *
+ * @example Testing — inject a MockProvider directly, no API key or network involved
+ * const antra = new Antra({ provider: new MockProvider({ respond: () => myFixture }) });
  */
 export class Antra {
   private readonly provider: Provider;
 
   constructor(config: AntraConfig) {
+    if (isCustomProviderConfig(config)) {
+      this.provider = config.provider;
+      return;
+    }
+
     if (isFallbackConfig(config)) {
       if (config.providers.length === 0) {
         throw new InvalidRequestError("Antra: `providers` must contain at least one entry.");

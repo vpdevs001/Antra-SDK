@@ -6,12 +6,15 @@ export type {
   ProviderSpec,
   SingleProviderConfig,
   FallbackConfig,
+  CustomProviderConfig,
 } from "./client.js";
 
 export { AnthropicProvider } from "./providers/anthropic/provider.js";
 export { OpenAIProvider } from "./providers/openai/provider.js";
 export { FallbackProvider } from "./providers/fallback.js";
 export type { FallbackEntry } from "./providers/fallback.js";
+export { MockProvider, sequence } from "./providers/mock/provider.js";
+export type { MockProviderConfig, MockResponder } from "./providers/mock/provider.js";
 
 export type {
   Message,

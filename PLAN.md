@@ -283,7 +283,7 @@ polished release, not required for the assignment's core marks.
 
 ---
 
-## Chapter 13 — Testing & Mocking
+## Chapter 13 — Testing & Mocking ✅ _Complete_
 
 - Mock `Provider` implementation (same interface as OpenAI/Anthropic)
   for deterministic, zero-cost testing
