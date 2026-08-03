@@ -47,6 +47,9 @@ export {
 export { defineTool } from "./tools/define-tool.js";
 export type { Tool } from "./tools/define-tool.js";
 
+export { createWebSearchTool } from "./tools/built-in/web-search.js";
+export type { WebSearchToolConfig } from "./tools/built-in/web-search.js";
+
 export { Agent, AgentBuilder } from "./agent/agent.js";
 export type { AgentRunOptions, StructuredRunOptions } from "./agent/agent.js";
 export type { AgentEvent, AgentListener, AgentResult, AgentFinishReason } from "./agent/types.js";

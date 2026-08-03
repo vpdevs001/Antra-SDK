@@ -270,7 +270,7 @@ call is cut off by a wall-clock limit rather than hanging indefinitely.
 
 ---
 
-## Chapter 12 — Built-in Tools _(lower priority)_
+## Chapter 12 — Built-in Tools _(lower priority)_ ✅ _Complete_
 
 Demoted from the original plan's Chapter 5 — the assignment requires
 that developers _can_ define custom tools well (already true as of
