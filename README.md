@@ -1,5 +1,7 @@
 # Antra SDK
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 The AI SDK for building type-safe, multi-provider AI agents with minimal boilerplate.
 
 Antra gives you a single, provider-agnostic API for calling LLMs, defining tools, and running full agent loops — with real tool-calling (not hand-parsed JSON), multi-provider fallback, guardrails, structured output, memory, multi-agent handoffs, streaming, and tracing built in from the ground up.

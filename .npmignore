@@ -1,0 +1,25 @@
+# Source and test code (dist is published)
+src/
+tests/
+
+# Configuration files
+tsconfig.json
+tsup.config.ts
+.prettierrc
+.prettierignore
+
+# Internal docs / plans
+PLAN.md
+
+# Environment and secrets
+.env
+.env.*
+
+# Logs and coverage
+*.log
+coverage/
+
+# OS / Editor files
+.DS_Store
+.vscode/
+.idea/
