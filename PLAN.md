@@ -294,7 +294,7 @@ polished release, not required for the assignment's core marks.
 
 ---
 
-## Chapter 14 — Documentation Site & Open-Source Packaging
+## Chapter 14 — Documentation Site & Open-Source Packaging ✅ _Complete_
 
 _(Assignment's Documentation section, plus original plan's packaging)_
 
